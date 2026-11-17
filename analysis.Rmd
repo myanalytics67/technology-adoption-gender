@@ -1,0 +1,832 @@
+---
+title: "onethree"
+author: "Mohnish"
+date: "2026-09-13"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(survey)
+library(readr)
+
+PER <- read_csv("PER.csv")
+HH <- read_csv("HH.csv")
+
+#Creating ID to combine data from household level and personal level
+
+PER <- PER %>%
+  mutate(
+    hh_id = paste(
+      `Schedule ID`,
+      `FSU Serial No.`,
+      `Sample hhld. No.`,
+      sep = "_"
+    ),
+    person_id = paste(
+      `Schedule ID`,
+      `FSU Serial No.`,
+      `Sample hhld. No.`,
+      `Person serial no.`,
+      sep = "_"
+    )
+  )
+
+HH <- HH %>%
+  mutate(
+    hh_id = paste(
+      `Schedule ID`,
+      `FSU Serial No.`,
+      `Sample hhld. No.`,
+      sep = "_"
+    )
+  )
+
+
+#Getting only the required columns from the PER dataset, this is done as the PER dataset is huge, therefore using only the required columns is efficient
+#Keeping activity records only if start and end time is present
+#Time is them converted into minutes for ease of analysis, using midnight as base, adding additional code to deal with instances where activities may cross midnight
+#person_id is then created again, leading to every activity with a label telling us who performed it 
+
+activity_data <- PER %>%
+  select(
+    `Schedule ID`,
+    `FSU Serial No.`,
+    `Sample hhld. No.`,
+    `Person serial no.`,
+    `day of week`,
+    `time from (HH:MM)`,
+    `time to (HH:MM)`,
+    `3-digit activity code`
+  ) %>%
+  filter(
+    !is.na(`time from (HH:MM)`),
+    !is.na(`time to (HH:MM)`)
+  ) %>%
+  mutate(
+    start_min =
+      as.numeric(`time from (HH:MM)`) / 60,
+
+    end_min =
+      as.numeric(`time to (HH:MM)`) / 60,
+
+    end_min =
+      ifelse(
+        end_min <= start_min,
+        end_min + 1440,
+        end_min
+      ),
+
+    person_id = paste(
+      `Schedule ID`,
+      `FSU Serial No.`,
+      `Sample hhld. No.`,
+      `Person serial no.`,
+      sep = "_"
+    )
+  )
+
+
+#Finding everyone who has washing clothes as an activity at least once in their day, for these people all other activity information is also kept 
+#as activities in the Time Use Survey can be done simultaneously. Example: Someone can be doing laundry from 10:00 - 11:00, while at the same time ironing previous clothes
+
+
+laundry_people <- unique(
+  activity_data$person_id[
+    activity_data$`3-digit activity code` == 341
+  ]
+)
+
+activity_data <- activity_data %>%
+  filter(
+    person_id %in% laundry_people
+  )
+
+cat(
+  "Laundry people:",
+  length(laundry_people),
+  "\n"
+)
+
+
+#As dataset is huge, chunking is used so that the code runs more smoothly, as there are approximately 1,00,000 observations, chunks of 5,000 can be used
+#Each activity is categorised into 30 minute time slots so that the number of activities happening per time slot can be counted
+#Washing activities (Code 341) is kept and 30 minutes is divided equally among simultaneous activities
+#Time is then added up to get total washing minutes
+
+chunk_size <- 5000
+
+n_chunks <- ceiling(
+  length(laundry_people) / chunk_size
+)
+
+cat(
+  "Chunks:",
+  n_chunks,
+  "\n"
+)
+
+results <- vector(
+  "list",
+  n_chunks
+)
+
+for (i in seq_len(n_chunks)) {
+
+  cat(
+    "Chunk",
+    i,
+    "of",
+    n_chunks,
+    "\n"
+  )
+
+  ids <- laundry_people[
+    ((i - 1) * chunk_size + 1):
+      min(
+        i * chunk_size,
+        length(laundry_people)
+      )
+  ]
+
+  chunk <- activity_data %>%
+    filter(
+      person_id %in% ids
+    ) %>%
+    rowwise() %>%
+    mutate(
+      slot_start = list(
+        seq(
+          floor(start_min / 30) * 30,
+          end_min - 30,
+          by = 30
+        )
+      )
+    ) %>%
+    ungroup() %>%
+    unnest(slot_start)
+
+  slot_counts <- chunk %>%
+    count(
+      person_id,
+      `day of week`,
+      slot_start,
+      name = "n_activities"
+    )
+
+  results[[i]] <- chunk %>%
+    filter(
+      `3-digit activity code` == 341
+    ) %>%
+    left_join(
+      slot_counts,
+      by = c(
+        "person_id",
+        "day of week",
+        "slot_start"
+      )
+    ) %>%
+    group_by(person_id) %>%
+    summarise(
+      laundry_minutes =
+        sum(
+          30 / n_activities,
+          na.rm = TRUE
+        ),
+      .groups = "drop"
+    )
+}
+
+
+#The chunk results are combined into one dataset
+#The distribuation of calculated laundry minutes is then checked
+
+laundry_allocated <- bind_rows(results)
+
+summary(
+  laundry_allocated$laundry_minutes
+)
+
+#One row is kept per person with relevant information
+#People with no washing activity are given 0 minutes
+#Household's washing type, size, expenditure etc. are added up
+
+final_data <- PER %>%
+  select(
+    hh_id,
+    person_id,
+    `Schedule ID`,
+    `FSU Serial No.`,
+    `Sample hhld. No.`,
+    `Person serial no.`,
+    Gender,
+    Age,
+    Sector,
+    Stratum,
+    `Sub-Stratum`,
+    `marital status`,
+    `highest level of education`,
+    `usual principal activity status (code)`,
+    MULT
+  ) %>%
+  distinct(
+    person_id,
+    .keep_all = TRUE
+  ) %>%
+  left_join(
+    laundry_allocated,
+    by = "person_id"
+  ) %>%
+  mutate(
+    laundry_minutes =
+      coalesce(
+        laundry_minutes,
+        0
+      )
+  ) %>%
+  left_join(
+    HH %>%
+      select(
+        hh_id,
+        `Type of washing of clothes`,
+        `Household size`,
+        `usual monthly consumer expenditure E: [A+B+C+(D+E)/12]`
+      ),
+    by = "hh_id"
+  )
+
+
+#Now we create the variables needed for the analysis like age, gender, washing type, etc.
+#There's also a variable created showing whether each person spent any time washing clothes
+#People aged only 6 and above are kept for the analysis
+
+final_data <- final_data %>%
+  mutate(
+
+    age_num =
+      as.numeric(Age),
+
+    gender_group =
+      factor(
+        case_when(
+          Gender == 1 ~ "Male",
+          Gender == 2 ~ "Female",
+          Gender == 3 ~ "Transgender"
+        ),
+        levels =
+          c(
+            "Male",
+            "Female",
+            "Transgender"
+          )
+      ),
+
+    washing_type =
+      factor(
+        case_when(
+          `Type of washing of clothes` == 1 ~
+            "Mechanical",
+          `Type of washing of clothes` == 2 ~
+            "Manual",
+          `Type of washing of clothes` == 3 ~
+            "Outsourced"
+        ),
+        levels =
+          c(
+            "Manual",
+            "Mechanical",
+            "Outsourced"
+          )
+      ),
+
+    education_factor =
+      factor(
+        `highest level of education`
+      ),
+
+    marital_factor =
+      factor(
+        `marital status`
+      ),
+
+    principal_activity_factor =
+      factor(
+        `usual principal activity status (code)`
+      ),
+
+    household_size =
+      as.numeric(
+        `Household size`
+      ),
+
+    household_expenditure =
+      as.numeric(
+        `usual monthly consumer expenditure E: [A+B+C+(D+E)/12]`
+      ),
+
+    laundry_positive =
+      as.numeric(
+        laundry_minutes > 0
+      )
+  ) %>%
+  filter(
+    age_num >= 6
+  )
+
+#Make R account for the way that the TUS survey was designed, includings weights, cluster, strata etc
+#Weights allow the study to describe wider populations
+
+reg_design <- svydesign(
+  ids =
+    ~`FSU Serial No.` + hh_id,
+
+  strata =
+    ~interaction(
+      Stratum,
+      `Sub-Stratum`,
+      drop = TRUE
+    ),
+
+  weights = ~MULT,
+
+  data = final_data,
+
+  nest = TRUE
+)
+
+
+#Calculating weighted average laundry time for each gender and washing combination
+#This should output descriptive comparison between men, women and transgender respondents
+#Differences between manual, mechanical and outsourced washing is also shown
+
+gender_washing_means <- svyby(
+  ~laundry_minutes,
+  ~gender_group + washing_type,
+  reg_design,
+  svymean,
+  na.rm = TRUE,
+  vartype = "se"
+)
+
+print(gender_washing_means)
+
+
+#The main regression is then run to examine the relation between gender and washing type
+#Key variable is gender x washing type, other characteristics are controlled
+
+
+model_main <- svyglm(
+  laundry_minutes ~
+    gender_group * washing_type +
+    age_num +
+    education_factor +
+    marital_factor +
+    principal_activity_factor +
+    household_size +
+    household_expenditure +
+    Sector,
+  design = reg_design
+)
+
+summary(model_main)
+
+
+#Participation model to check whether someone washed clothes at all
+#It looks at the probability of washing time rather than  number of minute spent
+#It can help us figure out whether time differences are because of lack in participation
+
+part1_model <- svyglm(
+  laundry_positive ~
+    gender_group * washing_type +
+    age_num +
+    education_factor +
+    marital_factor +
+    principal_activity_factor +
+    household_size +
+    household_expenditure +
+    Sector,
+  design = reg_design,
+  family = quasibinomial()
+)
+
+summary(part1_model)
+
+
+#Now we consider only the people who are participating in washing clothes
+#This means that we can get the time of people spent washing clothes separately from those who did not participate
+
+part2_model <- svyglm(
+  laundry_minutes ~
+    gender_group * washing_type +
+    age_num +
+    education_factor +
+    marital_factor +
+    principal_activity_factor +
+    household_size +
+    household_expenditure +
+    Sector,
+  design = subset(
+    reg_design,
+    laundry_minutes > 0
+  )
+)
+
+summary(part2_model)
+
+
+#The main regression is then run again and household expenditure is replaced with log expenditure
+
+
+logexp_data <- final_data %>%
+  mutate(
+    log_expenditure =
+      log(household_expenditure)
+  )
+
+logexp_design <- svydesign(
+  ids =
+    ~`FSU Serial No.` + hh_id,
+  strata =
+    ~interaction(
+      Stratum,
+      `Sub-Stratum`,
+      drop = TRUE
+    ),
+  weights = ~MULT,
+  data = logexp_data,
+  nest = TRUE
+)
+
+model_logexp <- svyglm(
+  laundry_minutes ~
+    gender_group * washing_type +
+    age_num +
+    education_factor +
+    marital_factor +
+    principal_activity_factor +
+    household_size +
+    log_expenditure +
+    Sector,
+  design = logexp_design
+)
+
+summary(model_logexp)
+
+
+#Transforming laundry minutes using log(1 + minutes) and running regression again, reducing influence of people with unusually high washing times and handles zero
+
+logy_data <- final_data %>%
+  mutate(
+    log_laundry =
+      log1p(laundry_minutes)
+  )
+
+logy_design <- svydesign(
+  ids =
+    ~`FSU Serial No.` + hh_id,
+  strata =
+    ~interaction(
+      Stratum,
+      `Sub-Stratum`,
+      drop = TRUE
+    ),
+  weights = ~MULT,
+  data = logy_data,
+  nest = TRUE
+)
+
+model_logy <- svyglm(
+  log_laundry ~
+    gender_group * washing_type +
+    age_num +
+    education_factor +
+    marital_factor +
+    principal_activity_factor +
+    household_size +
+    household_expenditure +
+    Sector,
+  design = logy_design
+)
+
+summary(model_logy)
+
+
+#Running main regression on only cis men and cis women as the survey unfortunately does not differentiate between trans men and trans women
+
+
+mf_data <- final_data %>%
+  filter(
+    gender_group %in%
+      c("Male", "Female")
+  ) %>%
+  droplevels()
+
+mf_design <- svydesign(
+  ids =
+    ~`FSU Serial No.` + hh_id,
+  strata =
+    ~interaction(
+      Stratum,
+      `Sub-Stratum`,
+      drop = TRUE
+    ),
+  weights = ~MULT,
+  data = mf_data,
+  nest = TRUE
+)
+
+model_mf <- svyglm(
+  laundry_minutes ~
+    gender_group * washing_type +
+    age_num +
+    education_factor +
+    marital_factor +
+    principal_activity_factor +
+    household_size +
+    household_expenditure +
+    Sector,
+  design = mf_design
+)
+
+summary(model_mf)
+
+
+#Seeing if the relationship differs across sectors
+
+model_sector <- svyglm(
+  laundry_minutes ~
+    gender_group * washing_type * Sector +
+    age_num +
+    education_factor +
+    marital_factor +
+    principal_activity_factor +
+    household_size +
+    household_expenditure,
+  design = reg_design
+)
+
+summary(model_sector)
+```
+
+```{r}
+#Final tables to be used in the report
+
+library(dplyr)
+library(ggplot2)
+library(knitr)
+
+
+#Table 1: Weighted mean laundry time
+
+report_table_1 <- gender_washing_means %>%
+  select(
+    gender_group,
+    washing_type,
+    laundry_minutes,
+    se
+  )
+
+names(report_table_1) <- c(
+  "Gender",
+  "Washing type",
+  "Mean laundry time (minutes)",
+  "Standard error"
+)
+
+report_table_1$`Mean laundry time (minutes)` <-
+  round(report_table_1$`Mean laundry time (minutes)`, 2)
+
+report_table_1$`Standard error` <-
+  round(report_table_1$`Standard error`, 2)
+
+kable(
+  report_table_1,
+  caption = "Weighted Mean Time Spent Washing Clothes by Gender and Washing Type"
+)
+
+
+#Figure 1: Raw weighted mean laundry time
+
+report_plot_1 <- gender_washing_means
+
+ggplot(
+  report_plot_1,
+  aes(
+    x = gender_group,
+    y = laundry_minutes,
+    fill = washing_type
+  )
+) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Average Time Spent Washing Clothes",
+    x = "Gender",
+    y = "Average laundry time (minutes)",
+    fill = "Washing type"
+  ) +
+  theme_minimal()
+
+
+#Figure 2: Adjusted predicted laundry time
+
+report_plot_2 <- data.frame(
+  Gender = c(
+    "Male",
+    "Male",
+    "Female",
+    "Female"
+  ),
+  WashingType = c(
+    "Manual",
+    "Mechanical",
+    "Manual",
+    "Mechanical"
+  ),
+  PredictedTime = c(
+    5.073129,
+    4.589748,
+    15.345432,
+    13.580828
+  )
+)
+
+ggplot(
+  report_plot_2,
+  aes(
+    x = Gender,
+    y = PredictedTime,
+    fill = WashingType
+  )
+) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Adjusted Predicted Time Spent Washing Clothes",
+    x = "Gender",
+    y = "Predicted laundry time (minutes)",
+    fill = "Washing type"
+  ) +
+  theme_minimal()
+
+
+#Table 2: Adjusted female male gap
+
+report_table_2 <- data.frame(
+  WashingType = c(
+    "Manual",
+    "Mechanical"
+  ),
+  MaleTime = c(
+    5.073129,
+    4.589748
+  ),
+  FemaleTime = c(
+    15.345432,
+    13.580828
+  )
+)
+
+report_table_2$GenderGap <-
+  report_table_2$FemaleTime -
+  report_table_2$MaleTime
+
+report_table_2$MaleTime <-
+  round(report_table_2$MaleTime, 2)
+
+report_table_2$FemaleTime <-
+  round(report_table_2$FemaleTime, 2)
+
+report_table_2$GenderGap <-
+  round(report_table_2$GenderGap, 2)
+
+names(report_table_2) <- c(
+  "Washing type",
+  "Male predicted time (minutes)",
+  "Female predicted time (minutes)",
+  "Female-male gap (minutes)"
+)
+
+kable(
+  report_table_2,
+  caption = "Adjusted Female-Male Gender Gap by Washing Type"
+)
+
+
+#Table 3, Main regression and robustness checks
+
+report_main <- coef(summary(model_main))[
+  "gender_groupFemale:washing_typeMechanical",
+  c(
+    "Estimate",
+    "Std. Error",
+    "t value",
+    "Pr(>|t|)"
+  )
+]
+
+report_logexp <- coef(summary(model_logexp))[
+  "gender_groupFemale:washing_typeMechanical",
+  c(
+    "Estimate",
+    "Std. Error",
+    "t value",
+    "Pr(>|t|)"
+  )
+]
+
+report_logy <- coef(summary(model_logy))[
+  "gender_groupFemale:washing_typeMechanical",
+  c(
+    "Estimate",
+    "Std. Error",
+    "t value",
+    "Pr(>|t|)"
+  )
+]
+
+report_mf <- coef(summary(model_mf))[
+  "gender_groupFemale:washing_typeMechanical",
+  c(
+    "Estimate",
+    "Std. Error",
+    "t value",
+    "Pr(>|t|)"
+  )
+]
+
+report_table_3 <- rbind(
+  "Main model" = report_main,
+  "Log expenditure" = report_logexp,
+  "Log outcome" = report_logy,
+  "Male/Female only" = report_mf
+)
+
+report_table_3 <- as.data.frame(report_table_3)
+
+report_table_3$Estimate <-
+  round(report_table_3$Estimate, 3)
+
+report_table_3$`Std. Error` <-
+  round(report_table_3$`Std. Error`, 3)
+
+report_table_3$`t value` <-
+  round(report_table_3$`t value`, 3)
+
+report_table_3$`Pr(>|t|)` <-
+  signif(report_table_3$`Pr(>|t|)`, 3)
+
+kable(
+  report_table_3,
+  caption = "Female × Mechanical Interaction: Main Model and Robustness Checks"
+)
+
+
+#Table 4: Two part model
+
+report_participation <- coef(summary(part1_model))[
+  "gender_groupFemale:washing_typeMechanical",
+  c(
+    "Estimate",
+    "Std. Error",
+    "t value",
+    "Pr(>|t|)"
+  )
+]
+
+report_conditional <- coef(summary(part2_model))[
+  "gender_groupFemale:washing_typeMechanical",
+  c(
+    "Estimate",
+    "Std. Error",
+    "t value",
+    "Pr(>|t|)"
+  )
+]
+
+report_table_4 <- rbind(
+  "Participation model" = report_participation,
+  "Conditional time model" = report_conditional
+)
+
+report_table_4 <- as.data.frame(report_table_4)
+
+report_table_4$Estimate <-
+  round(report_table_4$Estimate, 3)
+
+report_table_4$`Std. Error` <-
+  round(report_table_4$`Std. Error`, 3)
+
+report_table_4$`t value` <-
+  round(report_table_4$`t value`, 3)
+
+report_table_4$`Pr(>|t|)` <-
+  signif(report_table_4$`Pr(>|t|)`, 3)
+
+kable(
+  report_table_4,
+  caption = "Female × Mechanical Interaction in the Two-Part Model"
+)
+```
+
